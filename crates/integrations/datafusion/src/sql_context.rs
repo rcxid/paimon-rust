@@ -18,7 +18,7 @@
 //! SQL support for Paimon tables.
 //!
 //! DataFusion does not natively support all SQL statements needed by Paimon.
-//! This module provides [`PaimonSqlHandler`] which intercepts CREATE TABLE,
+//! This module provides [`SQLContext`] which intercepts CREATE TABLE,
 //! ALTER TABLE, MERGE INTO, UPDATE and other SQL, translates them to Paimon
 //! catalog operations, and delegates everything else (SELECT, CREATE/DROP
 //! SCHEMA, DROP TABLE, etc.) to the underlying [`SessionContext`].
@@ -64,54 +64,111 @@ use paimon::spec::{
 use crate::error::to_datafusion_error;
 use crate::DynamicOptions;
 
-/// Wraps a [`SessionContext`] and a Paimon [`Catalog`] to handle DDL statements
-/// that DataFusion does not natively support (e.g. ALTER TABLE).
-///
-/// For all other SQL, it delegates to the inner `SessionContext`.
+/// A SQL context that supports registering multiple Paimon catalogs and executing SQL.
 ///
 /// # Example
 /// ```ignore
-/// let ctx = SessionContext::new();
-/// let handler = PaimonSqlHandler::new(ctx, catalog, "paimon")?;
-/// let df = handler.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
+/// let mut ctx = SQLContext::new();
+/// ctx.register_catalog("paimon", catalog).await?;
+/// ctx.set_current_catalog("paimon").await?;
+/// let df = ctx.sql("ALTER TABLE paimon.db.t ADD COLUMN age INT").await?;
 /// ```
-pub struct PaimonSqlHandler {
+pub struct SQLContext {
     ctx: SessionContext,
-    catalog: Arc<dyn Catalog>,
-    /// The catalog name registered in the SessionContext (used to strip the catalog prefix).
-    catalog_name: String,
+    catalogs: HashMap<String, Arc<dyn Catalog>>,
     /// Session-scoped dynamic options set via `SET 'paimon.key' = 'value'`.
     dynamic_options: DynamicOptions,
 }
 
-impl PaimonSqlHandler {
-    /// Creates a new handler that registers the Paimon catalog and relation planner
-    /// on the given [`SessionContext`].
+impl Default for SQLContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SQLContext {
+    /// Creates a new empty SQL context.
+    pub fn new() -> Self {
+        let ctx = SessionContext::new();
+        ctx.register_relation_planner(Arc::new(
+            crate::relation_planner::PaimonRelationPlanner::new(),
+        ))
+        .expect("failed to register relation planner");
+        Self {
+            ctx,
+            catalogs: HashMap::new(),
+            dynamic_options: Default::default(),
+        }
+    }
+
+    /// Registers a Paimon catalog under the given name.
     ///
-    /// Dynamic options for `SET`/`RESET` are managed internally.
-    pub fn new(
-        ctx: SessionContext,
-        catalog: Arc<dyn Catalog>,
+    /// The first registered catalog automatically becomes the current catalog
+    /// for both Paimon-handled SQL and DataFusion-delegated SQL (SELECT, etc.).
+    /// A "default" database is created if it does not already exist (matching
+    /// the behavior of Spark/Flink Paimon catalogs).
+    pub async fn register_catalog(
+        &mut self,
         catalog_name: impl Into<String>,
-    ) -> DFResult<Self> {
+        catalog: Arc<dyn Catalog>,
+    ) -> DFResult<()> {
         let catalog_name = catalog_name.into();
-        let dynamic_options: DynamicOptions = Default::default();
-        ctx.register_catalog(
+        let is_first = self.catalogs.is_empty();
+
+        catalog
+            .create_database("default", true, Default::default())
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        self.ctx.register_catalog(
             &catalog_name,
             Arc::new(crate::catalog::PaimonCatalogProvider::with_dynamic_options(
                 catalog.clone(),
-                dynamic_options.clone(),
+                self.dynamic_options.clone(),
             )),
         );
-        ctx.register_relation_planner(Arc::new(
-            crate::relation_planner::PaimonRelationPlanner::new(),
-        ))?;
-        Ok(Self {
-            ctx,
-            catalog,
-            catalog_name,
-            dynamic_options,
-        })
+        self.catalogs.insert(catalog_name.clone(), catalog);
+        if is_first {
+            self.set_current_catalog(catalog_name).await?;
+            self.set_current_database("default").await?;
+        }
+        Ok(())
+    }
+
+    /// Sets the current catalog for unqualified table references.
+    pub async fn set_current_catalog(&mut self, catalog_name: impl Into<String>) -> DFResult<()> {
+        let catalog_name = catalog_name.into();
+        if !self.catalogs.contains_key(&catalog_name) {
+            return Err(DataFusionError::Plan(format!(
+                "Unknown catalog '{catalog_name}'"
+            )));
+        }
+        if catalog_name.contains('\'') {
+            return Err(DataFusionError::Plan(
+                "Catalog name must not contain single quotes".to_string(),
+            ));
+        }
+        self.ctx
+            .sql(&format!(
+                "SET datafusion.catalog.default_catalog = '{catalog_name}'"
+            ))
+            .await?;
+        Ok(())
+    }
+
+    /// Sets the current database (schema) for unqualified table references.
+    pub async fn set_current_database(&self, database_name: &str) -> DFResult<()> {
+        if database_name.contains('\'') {
+            return Err(DataFusionError::Plan(
+                "Database name must not contain single quotes".to_string(),
+            ));
+        }
+        self.ctx
+            .sql(&format!(
+                "SET datafusion.catalog.default_schema = '{database_name}'"
+            ))
+            .await?;
+        Ok(())
     }
 
     /// Returns a reference to the inner [`SessionContext`].
@@ -145,10 +202,16 @@ impl PaimonSqlHandler {
 
         match &statements[0] {
             Statement::CreateTable(create_table) => {
-                self.handle_create_table(create_table, partition_keys).await
+                let (catalog, _catalog_name, _) =
+                    self.resolve_catalog_and_table(&create_table.name)?;
+                self.handle_create_table(&catalog, create_table, partition_keys)
+                    .await
             }
             Statement::AlterTable(alter_table) => {
+                let (catalog, _catalog_name, _) =
+                    self.resolve_catalog_and_table(&alter_table.name)?;
                 self.handle_alter_table(
+                    &catalog,
                     &alter_table.name,
                     &alter_table.operations,
                     alter_table.if_exists,
@@ -200,8 +263,13 @@ impl PaimonSqlHandler {
             }
             Statement::Truncate(truncate) => self.handle_truncate_table(truncate).await,
             Statement::Call(func) => {
-                crate::procedures::execute_call(&self.ctx, &self.catalog, &self.catalog_name, func)
-                    .await
+                crate::procedures::execute_call(
+                    &self.ctx,
+                    &self.catalogs,
+                    &self.current_catalog_name(),
+                    func,
+                )
+                .await
             }
             _ => self.ctx.sql(sql).await,
         }
@@ -209,6 +277,7 @@ impl PaimonSqlHandler {
 
     async fn handle_create_table(
         &self,
+        catalog: &Arc<dyn Catalog>,
         ct: &CreateTable,
         partition_keys: Vec<String>,
     ) -> DFResult<DataFrame> {
@@ -270,7 +339,7 @@ impl PaimonSqlHandler {
 
         let schema = builder.build().map_err(to_datafusion_error)?;
 
-        self.catalog
+        catalog
             .create_table(&identifier, schema, ct.if_not_exists)
             .await
             .map_err(to_datafusion_error)?;
@@ -280,6 +349,7 @@ impl PaimonSqlHandler {
 
     async fn handle_alter_table(
         &self,
+        catalog: &Arc<dyn Catalog>,
         name: &ObjectName,
         operations: &[AlterTableOperation],
         if_exists: bool,
@@ -340,6 +410,7 @@ impl PaimonSqlHandler {
                 } => {
                     return self
                         .handle_drop_partitions(
+                            catalog,
                             &identifier,
                             partitions,
                             if_exists || *partition_if_exists,
@@ -355,14 +426,14 @@ impl PaimonSqlHandler {
         }
 
         if let Some(new_identifier) = rename_to {
-            self.catalog
+            catalog
                 .rename_table(&identifier, &new_identifier, if_exists)
                 .await
                 .map_err(to_datafusion_error)?;
         }
 
         if !changes.is_empty() {
-            self.catalog
+            catalog
                 .alter_table(&identifier, changes, if_exists)
                 .await
                 .map_err(to_datafusion_error)?;
@@ -372,7 +443,6 @@ impl PaimonSqlHandler {
     }
 
     async fn handle_merge_into(&self, merge: &Merge) -> DFResult<DataFrame> {
-        // Resolve the target table name from the MERGE INTO clause
         let table_name = match &merge.table {
             TableFactor::Table { name, .. } => name.clone(),
             other => {
@@ -381,11 +451,9 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
-        // Load the Paimon table from the catalog
-        let table = self
-            .catalog
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -402,10 +470,9 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
-        let table = self
-            .catalog
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -429,10 +496,9 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
 
-        let table = self
-            .catalog
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -450,9 +516,8 @@ impl PaimonSqlHandler {
                 )))
             }
         };
-        let identifier = self.resolve_table_name(&table_name)?;
-        let table = self
-            .catalog
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&table_name)?;
+        let table = catalog
             .get_table(&identifier)
             .await
             .map_err(to_datafusion_error)?;
@@ -585,8 +650,8 @@ impl PaimonSqlHandler {
         let target = truncate.table_names.first().ok_or_else(|| {
             DataFusionError::Plan("TRUNCATE TABLE requires a table name".to_string())
         })?;
-        let identifier = self.resolve_table_name(&target.name)?;
-        let table = match self.catalog.get_table(&identifier).await {
+        let (catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(&target.name)?;
+        let table = match catalog.get_table(&identifier).await {
             Ok(t) => t,
             Err(e) if truncate.if_exists && is_table_not_exist(&e) => {
                 return ok_result(&self.ctx);
@@ -621,6 +686,7 @@ impl PaimonSqlHandler {
 
     async fn handle_drop_partitions(
         &self,
+        catalog: &Arc<dyn Catalog>,
         identifier: &Identifier,
         partitions: &[SqlExpr],
         if_exists: bool,
@@ -630,7 +696,7 @@ impl PaimonSqlHandler {
                 "DROP PARTITIONS requires at least one partition specification".to_string(),
             ));
         }
-        let table = match self.catalog.get_table(identifier).await {
+        let table = match catalog.get_table(identifier).await {
             Ok(t) => t,
             Err(e) if if_exists && is_table_not_exist(&e) => {
                 return ok_result(&self.ctx);
@@ -654,8 +720,30 @@ impl PaimonSqlHandler {
         ok_result(&self.ctx)
     }
 
-    /// Resolve an ObjectName like `paimon.db.table` or `db.table` to a Paimon Identifier.
-    fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
+    /// Returns the name of the current default catalog from DataFusion config.
+    fn current_catalog_name(&self) -> String {
+        self.ctx
+            .state()
+            .config_options()
+            .catalog
+            .default_catalog
+            .clone()
+    }
+
+    fn current_catalog(&self) -> DFResult<Arc<dyn Catalog>> {
+        let name = self.current_catalog_name();
+        self.catalogs.get(&name).cloned().ok_or_else(|| {
+            DataFusionError::Plan(
+                "No catalog registered. Call register_catalog() first.".to_string(),
+            )
+        })
+    }
+
+    /// Resolve an ObjectName like `catalog.db.table` or `db.table` to a catalog and Identifier.
+    fn resolve_catalog_and_table(
+        &self,
+        name: &ObjectName,
+    ) -> DFResult<(Arc<dyn Catalog>, String, Identifier)> {
         let parts: Vec<String> = name
             .0
             .iter()
@@ -663,24 +751,48 @@ impl PaimonSqlHandler {
             .collect();
         match parts.len() {
             3 => {
-                // catalog.database.table — strip catalog prefix
-                if parts[0] != self.catalog_name {
-                    return Err(DataFusionError::Plan(format!(
-                        "Unknown catalog '{}', expected '{}'",
-                        parts[0], self.catalog_name
-                    )));
-                }
-                Ok(Identifier::new(parts[1].clone(), parts[2].clone()))
+                let catalog = self.catalogs.get(&parts[0]).ok_or_else(|| {
+                    DataFusionError::Plan(format!("Unknown catalog '{}'", parts[0]))
+                })?;
+                Ok((
+                    catalog.clone(),
+                    parts[0].clone(),
+                    Identifier::new(parts[1].clone(), parts[2].clone()),
+                ))
             }
-            2 => Ok(Identifier::new(parts[0].clone(), parts[1].clone())),
-            1 => Err(DataFusionError::Plan(format!(
-                "ALTER TABLE requires at least database.table, got: {}",
-                parts[0]
-            ))),
+            2 => {
+                let catalog = self.current_catalog()?;
+                Ok((
+                    catalog,
+                    self.current_catalog_name(),
+                    Identifier::new(parts[0].clone(), parts[1].clone()),
+                ))
+            }
+            1 => {
+                let catalog = self.current_catalog()?;
+                let default_schema = self
+                    .ctx
+                    .state()
+                    .config_options()
+                    .catalog
+                    .default_schema
+                    .clone();
+                Ok((
+                    catalog,
+                    self.current_catalog_name(),
+                    Identifier::new(default_schema, parts[0].clone()),
+                ))
+            }
             _ => Err(DataFusionError::Plan(format!(
                 "Invalid table reference: {name}"
             ))),
         }
+    }
+
+    /// Resolve an ObjectName to just the Identifier (for backward compat in handle_alter_table).
+    fn resolve_table_name(&self, name: &ObjectName) -> DFResult<Identifier> {
+        let (_catalog, _catalog_name, identifier) = self.resolve_catalog_and_table(name)?;
+        Ok(identifier)
     }
 }
 
@@ -1528,8 +1640,10 @@ mod tests {
         }
     }
 
-    fn make_handler(catalog: Arc<MockCatalog>) -> PaimonSqlHandler {
-        PaimonSqlHandler::new(SessionContext::new(), catalog, "paimon").unwrap()
+    async fn make_sql_context(catalog: Arc<MockCatalog>) -> SQLContext {
+        let mut ctx = SQLContext::new();
+        ctx.register_catalog("paimon", catalog).await.unwrap();
+        ctx
     }
 
     fn assert_sql_type_to_paimon(
@@ -1757,10 +1871,10 @@ mod tests {
 
     // ==================== resolve_table_name tests ====================
 
-    #[test]
-    fn test_resolve_three_part_name() {
+    #[tokio::test]
+    async fn test_resolve_three_part_name() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
+        let sql_context = make_sql_context(catalog).await;
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, "SELECT * FROM paimon.mydb.mytable").unwrap();
         if let Statement::Query(q) = &stmts[0] {
@@ -1768,7 +1882,7 @@ mod tests {
                 if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
                     &sel.from[0].relation
                 {
-                    let id = handler.resolve_table_name(name).unwrap();
+                    let id = sql_context.resolve_table_name(name).unwrap();
                     assert_eq!(id.database(), "mydb");
                     assert_eq!(id.object(), "mytable");
                 }
@@ -1776,10 +1890,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_two_part_name() {
+    #[tokio::test]
+    async fn test_resolve_two_part_name() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
+        let sql_context = make_sql_context(catalog).await;
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, "SELECT * FROM mydb.mytable").unwrap();
         if let Statement::Query(q) = &stmts[0] {
@@ -1787,7 +1901,7 @@ mod tests {
                 if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
                     &sel.from[0].relation
                 {
-                    let id = handler.resolve_table_name(name).unwrap();
+                    let id = sql_context.resolve_table_name(name).unwrap();
                     assert_eq!(id.database(), "mydb");
                     assert_eq!(id.object(), "mytable");
                 }
@@ -1795,10 +1909,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_resolve_wrong_catalog_name() {
+    #[tokio::test]
+    async fn test_resolve_wrong_catalog_name() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
+        let sql_context = make_sql_context(catalog).await;
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, "SELECT * FROM other.mydb.mytable").unwrap();
         if let Statement::Query(q) = &stmts[0] {
@@ -1806,17 +1920,17 @@ mod tests {
                 if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
                     &sel.from[0].relation
                 {
-                    let err = handler.resolve_table_name(name).unwrap_err();
+                    let err = sql_context.resolve_table_name(name).unwrap_err();
                     assert!(err.to_string().contains("Unknown catalog"));
                 }
             }
         }
     }
 
-    #[test]
-    fn test_resolve_single_part_name_error() {
+    #[tokio::test]
+    async fn test_resolve_single_part_name_uses_default_schema() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
+        let sql_context = make_sql_context(catalog).await;
         let dialect = GenericDialect {};
         let stmts = Parser::parse_sql(&dialect, "SELECT * FROM mytable").unwrap();
         if let Statement::Query(q) = &stmts[0] {
@@ -1824,8 +1938,9 @@ mod tests {
                 if let datafusion::sql::sqlparser::ast::TableFactor::Table { name, .. } =
                     &sel.from[0].relation
                 {
-                    let err = handler.resolve_table_name(name).unwrap_err();
-                    assert!(err.to_string().contains("at least database.table"));
+                    let id = sql_context.resolve_table_name(name).unwrap();
+                    assert_eq!(id.database(), "default");
+                    assert_eq!(id.object(), "mytable");
                 }
             }
         }
@@ -1855,14 +1970,14 @@ mod tests {
         }
     }
 
-    // ==================== PaimonSqlHandler::sql integration tests ====================
+    // ==================== SQLContext::sql integration tests ====================
 
     #[tokio::test]
     async fn test_create_table_basic() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE mydb.t1 (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id))")
             .await
             .unwrap();
@@ -1887,9 +2002,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_if_not_exists() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE IF NOT EXISTS mydb.t1 (id INT)")
             .await
             .unwrap();
@@ -1909,9 +2024,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_with_options() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE mydb.t1 (id INT) WITH ('bucket' = '4', 'file.format' = 'parquet')")
             .await
             .unwrap();
@@ -1930,9 +2045,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_three_part_name() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE paimon.mydb.t1 (id INT)")
             .await
             .unwrap();
@@ -1949,9 +2064,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_blob_type_preserved() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE mydb.t1 (id INT, payload BLOB NOT NULL) WITH ('data-evolution.enabled' = 'true')")
             .await
             .unwrap();
@@ -1973,9 +2088,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_add_column() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE mydb.t1 ADD COLUMN age INT")
             .await
             .unwrap();
@@ -2002,9 +2117,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_add_blob_column() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE mydb.t1 ADD COLUMN payload BLOB")
             .await
             .unwrap();
@@ -2029,9 +2144,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_drop_column() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE mydb.t1 DROP COLUMN age")
             .await
             .unwrap();
@@ -2051,9 +2166,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_rename_column() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE mydb.t1 RENAME COLUMN old_name TO new_name")
             .await
             .unwrap();
@@ -2075,9 +2190,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_rename_table() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE mydb.t1 RENAME TO t2")
             .await
             .unwrap();
@@ -2097,9 +2212,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_if_exists_add_column() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE IF EXISTS mydb.t1 ADD COLUMN age INT")
             .await
             .unwrap();
@@ -2120,9 +2235,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_without_if_exists() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE mydb.t1 ADD COLUMN age INT")
             .await
             .unwrap();
@@ -2142,9 +2257,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_if_exists_rename() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE IF EXISTS mydb.t1 RENAME TO t2")
             .await
             .unwrap();
@@ -2168,9 +2283,9 @@ mod tests {
     #[tokio::test]
     async fn test_alter_table_rename_three_part_name() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE paimon.mydb.t1 RENAME TO t2")
             .await
             .unwrap();
@@ -2190,8 +2305,8 @@ mod tests {
     #[tokio::test]
     async fn test_sql_parse_error() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        let result = handler.sql("NOT VALID SQL !!!").await;
+        let sql_context = make_sql_context(catalog).await;
+        let result = sql_context.sql("NOT VALID SQL !!!").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("SQL parse error"));
     }
@@ -2199,8 +2314,8 @@ mod tests {
     #[tokio::test]
     async fn test_multiple_statements_error() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        let result = handler.sql("SELECT 1; SELECT 2").await;
+        let sql_context = make_sql_context(catalog).await;
+        let result = sql_context.sql("SELECT 1; SELECT 2").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2211,8 +2326,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_external_table_rejected() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        let result = handler
+        let sql_context = make_sql_context(catalog).await;
+        let result = sql_context
             .sql("CREATE EXTERNAL TABLE mydb.t1 (id INT) STORED AS PARQUET")
             .await;
         assert!(result.is_err());
@@ -2225,9 +2340,9 @@ mod tests {
     #[tokio::test]
     async fn test_non_ddl_delegates_to_datafusion() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
+        let sql_context = make_sql_context(catalog.clone()).await;
         // SELECT should be delegated to DataFusion, not intercepted
-        let df = handler.sql("SELECT 1 AS x").await.unwrap();
+        let df = sql_context.sql("SELECT 1 AS x").await.unwrap();
         let batches = df.collect().await.unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -2370,8 +2485,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_partition_key_not_in_columns() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        let err = handler
+        let sql_context = make_sql_context(catalog).await;
+        let err = sql_context
             .sql("CREATE TABLE mydb.t (id INT, dt STRING) PARTITIONED BY (nonexistent)")
             .await
             .unwrap_err();
@@ -2381,8 +2496,8 @@ mod tests {
     #[tokio::test]
     async fn test_create_table_partition_key_matches_column() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog.clone());
-        handler
+        let sql_context = make_sql_context(catalog.clone()).await;
+        sql_context
             .sql("CREATE TABLE mydb.t (id INT, dt STRING) PARTITIONED BY (dt)")
             .await
             .unwrap();
@@ -2400,68 +2515,73 @@ mod tests {
     #[tokio::test]
     async fn test_set_paimon_option() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        handler
+        let sql_context = make_sql_context(catalog).await;
+        sql_context
             .sql("SET 'paimon.scan.version' = '1'")
             .await
             .unwrap();
-        let opts = handler.dynamic_options().read().unwrap();
+        let opts = sql_context.dynamic_options().read().unwrap();
         assert_eq!(opts.get("scan.version").unwrap(), "1");
     }
 
     #[tokio::test]
     async fn test_set_paimon_option_overwrites() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        handler
+        let sql_context = make_sql_context(catalog).await;
+        sql_context
             .sql("SET 'paimon.scan.version' = '1'")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("SET 'paimon.scan.version' = '2'")
             .await
             .unwrap();
-        let opts = handler.dynamic_options().read().unwrap();
+        let opts = sql_context.dynamic_options().read().unwrap();
         assert_eq!(opts.get("scan.version").unwrap(), "2");
     }
 
     #[tokio::test]
     async fn test_reset_paimon_option() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        handler
+        let sql_context = make_sql_context(catalog).await;
+        sql_context
             .sql("SET 'paimon.scan.version' = '1'")
             .await
             .unwrap();
-        handler.sql("RESET 'paimon.scan.version'").await.unwrap();
-        let opts = handler.dynamic_options().read().unwrap();
+        sql_context
+            .sql("RESET 'paimon.scan.version'")
+            .await
+            .unwrap();
+        let opts = sql_context.dynamic_options().read().unwrap();
         assert!(opts.get("scan.version").is_none());
     }
 
     #[tokio::test]
     async fn test_set_non_paimon_option_delegates() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
+        let sql_context = make_sql_context(catalog).await;
         // DataFusion handles non-paimon SET; should not error and should not
         // appear in dynamic_options.
-        let _ = handler.sql("SET datafusion.optimizer.max_passes = 3").await;
-        let opts = handler.dynamic_options().read().unwrap();
+        let _ = sql_context
+            .sql("SET datafusion.optimizer.max_passes = 3")
+            .await;
+        let opts = sql_context.dynamic_options().read().unwrap();
         assert!(opts.is_empty());
     }
 
     #[tokio::test]
     async fn test_set_multiple_paimon_options() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        handler
+        let sql_context = make_sql_context(catalog).await;
+        sql_context
             .sql("SET 'paimon.scan.version' = '1'")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("SET 'paimon.scan.timestamp-millis' = '1000'")
             .await
             .unwrap();
-        let opts = handler.dynamic_options().read().unwrap();
+        let opts = sql_context.dynamic_options().read().unwrap();
         assert_eq!(opts.len(), 2);
         assert_eq!(opts.get("scan.version").unwrap(), "1");
         assert_eq!(opts.get("scan.timestamp-millis").unwrap(), "1000");
@@ -2470,15 +2590,18 @@ mod tests {
     #[tokio::test]
     async fn test_reset_nonexistent_paimon_option_is_noop() {
         let catalog = Arc::new(MockCatalog::new());
-        let handler = make_handler(catalog);
-        handler.sql("RESET 'paimon.scan.version'").await.unwrap();
-        let opts = handler.dynamic_options().read().unwrap();
+        let sql_context = make_sql_context(catalog).await;
+        sql_context
+            .sql("RESET 'paimon.scan.version'")
+            .await
+            .unwrap();
+        let opts = sql_context.dynamic_options().read().unwrap();
         assert!(opts.is_empty());
     }
 
     // ==================== TRUNCATE TABLE / DROP PARTITIONS tests ====================
 
-    async fn setup_fs_handler() -> (tempfile::TempDir, PaimonSqlHandler) {
+    async fn setup_fs_sql_context() -> (tempfile::TempDir, SQLContext) {
         use paimon::{CatalogOptions, FileSystemCatalog, Options};
 
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -2487,22 +2610,28 @@ mod tests {
         options.set(CatalogOptions::WAREHOUSE, warehouse);
         let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
 
-        let handler =
-            PaimonSqlHandler::new(SessionContext::new(), catalog.clone(), "paimon").unwrap();
-        handler.sql("CREATE SCHEMA paimon.test_db").await.unwrap();
+        let mut sql_context = SQLContext::new();
+        sql_context
+            .register_catalog("paimon", catalog.clone())
+            .await
+            .unwrap();
+        sql_context
+            .sql("CREATE SCHEMA paimon.test_db")
+            .await
+            .unwrap();
 
-        (temp_dir, handler)
+        (temp_dir, sql_context)
     }
 
     #[tokio::test]
     async fn test_truncate_table() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE paimon.test_db.t1 (id INT, value INT)")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("INSERT INTO paimon.test_db.t1 VALUES (1, 10), (2, 20)")
             .await
             .unwrap()
@@ -2510,12 +2639,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql("TRUNCATE TABLE paimon.test_db.t1")
             .await
             .unwrap();
 
-        let batches = handler
+        let batches = sql_context
             .sql("SELECT * FROM paimon.test_db.t1")
             .await
             .unwrap()
@@ -2528,13 +2657,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate_table_partition() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE paimon.test_db.t2 (pt VARCHAR, id INT) PARTITIONED BY (pt)")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("INSERT INTO paimon.test_db.t2 VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)")
             .await
             .unwrap()
@@ -2542,12 +2671,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql("TRUNCATE TABLE paimon.test_db.t2 PARTITION (pt = 'a')")
             .await
             .unwrap();
 
-        let batches = handler
+        let batches = sql_context
             .sql("SELECT pt, id FROM paimon.test_db.t2 ORDER BY id")
             .await
             .unwrap()
@@ -2576,13 +2705,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alter_table_drop_partitions() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE paimon.test_db.t3 (pt VARCHAR, id INT) PARTITIONED BY (pt)")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("INSERT INTO paimon.test_db.t3 VALUES ('a', 1), ('a', 2), ('b', 3), ('b', 4)")
             .await
             .unwrap()
@@ -2590,12 +2719,12 @@ mod tests {
             .await
             .unwrap();
 
-        handler
+        sql_context
             .sql("ALTER TABLE paimon.test_db.t3 DROP PARTITION (pt = 'b')")
             .await
             .unwrap();
 
-        let batches = handler
+        let batches = sql_context
             .sql("SELECT pt, id FROM paimon.test_db.t3 ORDER BY id")
             .await
             .unwrap()
@@ -2624,13 +2753,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate_table_incomplete_partition_spec() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE paimon.test_db.t_multi (pt1 VARCHAR, pt2 VARCHAR, id INT) PARTITIONED BY (pt1, pt2)")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("INSERT INTO paimon.test_db.t_multi VALUES ('a', 'x', 1)")
             .await
             .unwrap()
@@ -2638,7 +2767,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = handler
+        let err = sql_context
             .sql("TRUNCATE TABLE paimon.test_db.t_multi PARTITION (pt1 = 'a')")
             .await
             .unwrap_err();
@@ -2650,9 +2779,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate_table_if_exists_nonexistent() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("TRUNCATE TABLE IF EXISTS paimon.test_db.nonexistent")
             .await
             .unwrap();
@@ -2660,9 +2789,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate_table_nonexistent_without_if_exists() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        let err = handler
+        let err = sql_context
             .sql("TRUNCATE TABLE paimon.test_db.nonexistent")
             .await
             .unwrap_err();
@@ -2674,9 +2803,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_alter_table_if_exists_drop_partition_nonexistent() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("ALTER TABLE IF EXISTS paimon.test_db.nonexistent DROP PARTITION (pt = 'a')")
             .await
             .unwrap();
@@ -2684,13 +2813,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_partition_incomplete_spec() {
-        let (_tmp, handler) = setup_fs_handler().await;
+        let (_tmp, sql_context) = setup_fs_sql_context().await;
 
-        handler
+        sql_context
             .sql("CREATE TABLE paimon.test_db.t_dp (pt1 VARCHAR, pt2 VARCHAR, id INT) PARTITIONED BY (pt1, pt2)")
             .await
             .unwrap();
-        handler
+        sql_context
             .sql("INSERT INTO paimon.test_db.t_dp VALUES ('a', 'x', 1)")
             .await
             .unwrap()
@@ -2698,7 +2827,7 @@ mod tests {
             .await
             .unwrap();
 
-        let err = handler
+        let err = sql_context
             .sql("ALTER TABLE paimon.test_db.t_dp DROP PARTITION (pt1 = 'a')")
             .await
             .unwrap_err();

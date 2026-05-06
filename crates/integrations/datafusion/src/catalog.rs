@@ -42,7 +42,7 @@ use crate::DynamicOptions;
 pub struct PaimonCatalogProvider {
     /// Reference to the Paimon catalog.
     catalog: Arc<dyn Catalog>,
-    /// Session-scoped dynamic options shared with the SQL handler.
+    /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
 }
 
@@ -56,7 +56,7 @@ impl PaimonCatalogProvider {
     /// Creates a new [`PaimonCatalogProvider`].
     ///
     /// For standalone use without `SET`/`RESET` support.
-    /// When used via [`PaimonSqlHandler`], the handler creates the provider
+    /// When used via [`SQLContext`], the handler creates the provider
     /// internally with shared dynamic options.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
         PaimonCatalogProvider {
@@ -178,7 +178,7 @@ pub struct PaimonSchemaProvider {
     catalog: Arc<dyn Catalog>,
     /// Database name this schema represents.
     database: String,
-    /// Session-scoped dynamic options shared with the SQL handler.
+    /// Session-scoped dynamic options shared with the SQL context.
     dynamic_options: DynamicOptions,
 }
 

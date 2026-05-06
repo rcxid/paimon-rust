@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! SQL handler integration tests for paimon-datafusion.
+//! SQL context integration tests for paimon-datafusion.
 
 use std::sync::Arc;
 
 use datafusion::catalog::CatalogProvider;
-use datafusion::prelude::SessionContext;
 use paimon::catalog::Identifier;
 use paimon::spec::{ArrayType, BlobType, DataType, IntType, MapType, VarCharType};
 use paimon::{Catalog, CatalogOptions, FileSystemCatalog, Options};
-use paimon_datafusion::{PaimonCatalogProvider, PaimonSqlHandler};
+use paimon_datafusion::{PaimonCatalogProvider, SQLContext};
 use tempfile::TempDir;
 
 fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
@@ -36,9 +35,10 @@ fn create_test_env() -> (TempDir, Arc<FileSystemCatalog>) {
     (temp_dir, Arc::new(catalog))
 }
 
-fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
-    let ctx = SessionContext::new();
-    PaimonSqlHandler::new(ctx, catalog, "paimon").unwrap()
+async fn create_sql_context(catalog: Arc<FileSystemCatalog>) -> SQLContext {
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog).await.unwrap();
+    ctx
 }
 
 // ======================= CREATE / DROP SCHEMA =======================
@@ -46,9 +46,9 @@ fn create_handler(catalog: Arc<FileSystemCatalog>) -> PaimonSqlHandler {
 #[tokio::test]
 async fn test_create_schema() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
-    handler
+    sql_context
         .sql("CREATE SCHEMA paimon.test_db")
         .await
         .expect("CREATE SCHEMA should succeed");
@@ -63,14 +63,14 @@ async fn test_create_schema() {
 #[tokio::test]
 async fn test_drop_schema() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("drop_me", false, Default::default())
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("DROP SCHEMA paimon.drop_me CASCADE")
         .await
         .expect("DROP SCHEMA should succeed");
@@ -106,14 +106,14 @@ async fn test_schema_names_via_catalog_provider() {
 #[tokio::test]
 async fn test_create_table() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.mydb.users (
                 id INT NOT NULL,
@@ -144,14 +144,14 @@ async fn test_create_table() {
 #[tokio::test]
 async fn test_create_table_with_blob_type() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.mydb.assets (
                 id INT NOT NULL,
@@ -178,14 +178,14 @@ async fn test_create_table_with_blob_type() {
 #[tokio::test]
 async fn test_create_table_with_partition() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.mydb.events (
                 id INT NOT NULL,
@@ -215,14 +215,14 @@ async fn test_create_table_with_partition() {
 #[tokio::test]
 async fn test_create_table_partitioned_by_rejects_typed_columns() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    let err = handler
+    let err = sql_context
         .sql(
             "CREATE TABLE paimon.mydb.events (
                 id INT NOT NULL,
@@ -242,7 +242,7 @@ async fn test_create_table_partitioned_by_rejects_typed_columns() {
 #[tokio::test]
 async fn test_create_table_if_not_exists() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
@@ -254,10 +254,13 @@ async fn test_create_table_if_not_exists() {
     )";
 
     // First create should succeed
-    handler.sql(sql).await.expect("First CREATE should succeed");
+    sql_context
+        .sql(sql)
+        .await
+        .expect("First CREATE should succeed");
 
     // Second create with IF NOT EXISTS should also succeed
-    handler
+    sql_context
         .sql(sql)
         .await
         .expect("Second CREATE with IF NOT EXISTS should succeed");
@@ -266,14 +269,14 @@ async fn test_create_table_if_not_exists() {
 #[tokio::test]
 async fn test_create_external_table_rejected() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    let result = handler
+    let result = sql_context
         .sql(
             "CREATE EXTERNAL TABLE paimon.mydb.bad (
                 id INT NOT NULL
@@ -295,14 +298,14 @@ async fn test_create_external_table_rejected() {
 #[tokio::test]
 async fn test_create_table_with_array_and_map() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.mydb.complex_types (
                 id INT NOT NULL,
@@ -349,14 +352,14 @@ async fn test_create_table_with_array_and_map() {
 #[tokio::test]
 async fn test_create_table_with_row_type() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql(
             "CREATE TABLE paimon.mydb.row_table (
                 id INT NOT NULL,
@@ -393,7 +396,7 @@ async fn test_create_table_with_row_type() {
 #[tokio::test]
 async fn test_drop_table() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
@@ -419,7 +422,7 @@ async fn test_drop_table() {
         .unwrap()
         .contains(&"to_drop".to_string()));
 
-    handler
+    sql_context
         .sql("DROP TABLE paimon.mydb.to_drop")
         .await
         .expect("DROP TABLE should succeed");
@@ -439,7 +442,7 @@ async fn test_drop_table() {
 #[tokio::test]
 async fn test_alter_table_add_column() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
@@ -463,7 +466,7 @@ async fn test_alter_table_add_column() {
         .unwrap();
 
     // ALTER TABLE is not yet implemented in FileSystemCatalog, so we expect an error
-    let result = handler
+    let result = sql_context
         .sql("ALTER TABLE paimon.mydb.alter_test ADD COLUMN age INT")
         .await;
 
@@ -484,7 +487,7 @@ async fn test_alter_table_add_column() {
 #[tokio::test]
 async fn test_alter_table_rename() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
@@ -503,7 +506,7 @@ async fn test_alter_table_rename() {
         .await
         .unwrap();
 
-    handler
+    sql_context
         .sql("ALTER TABLE mydb.old_name RENAME TO new_name")
         .await
         .expect("ALTER TABLE RENAME should succeed");
@@ -520,9 +523,9 @@ async fn test_alter_table_rename() {
 }
 
 #[tokio::test]
-async fn test_ddl_handler_delegates_select() {
+async fn test_ddl_context_delegates_select() {
     let (_tmp, catalog) = create_test_env();
-    let handler = create_handler(catalog.clone());
+    let sql_context = create_sql_context(catalog.clone()).await;
 
     catalog
         .create_database("mydb", false, Default::default())
@@ -542,7 +545,7 @@ async fn test_ddl_handler_delegates_select() {
         .unwrap();
 
     // SELECT should be delegated to DataFusion
-    let df = handler
+    let df = sql_context
         .sql("SELECT * FROM paimon.mydb.t1")
         .await
         .expect("SELECT should be delegated to DataFusion");
@@ -551,4 +554,198 @@ async fn test_ddl_handler_delegates_select() {
     // Empty table, but should succeed
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total_rows, 0, "Empty table should return 0 rows");
+}
+
+// ======================= MULTI-CATALOG =======================
+
+#[tokio::test]
+async fn test_multi_catalog_register_and_query() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1).await.unwrap();
+    ctx.register_catalog("cat2", catalog2).await.unwrap();
+
+    ctx.sql("CREATE SCHEMA cat1.db1").await.unwrap();
+    ctx.sql("CREATE SCHEMA cat2.db2").await.unwrap();
+
+    ctx.sql("CREATE TABLE cat1.db1.t (id INT NOT NULL, name STRING, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+    ctx.sql("CREATE TABLE cat2.db2.t (id INT NOT NULL, value STRING, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+
+    ctx.sql("INSERT INTO cat1.db1.t VALUES (1, 'alice')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO cat2.db2.t VALUES (2, 'hello')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let batches = ctx
+        .sql("SELECT id, name FROM cat1.db1.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+
+    let batches = ctx
+        .sql("SELECT id, value FROM cat2.db2.t")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn test_set_current_catalog() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1).await.unwrap();
+    ctx.register_catalog("cat2", catalog2).await.unwrap();
+
+    ctx.sql("CREATE SCHEMA cat1.mydb").await.unwrap();
+    ctx.sql("CREATE TABLE cat1.mydb.t (id INT NOT NULL, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+
+    ctx.set_current_catalog("cat1").await.unwrap();
+    ctx.set_current_database("mydb").await.unwrap();
+
+    // Unqualified query should resolve against cat1.mydb
+    let df = ctx.sql("SELECT * FROM t").await;
+    assert!(
+        df.is_ok(),
+        "Unqualified table should resolve via current catalog/database"
+    );
+
+    // Switching to unknown catalog should fail
+    let err = ctx.set_current_catalog("nonexistent").await;
+    assert!(err.is_err());
+}
+
+#[tokio::test]
+async fn test_set_default_catalog_via_datafusion_config() {
+    let (_tmp1, catalog1) = create_test_env();
+    let (_tmp2, catalog2) = create_test_env();
+
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("cat1", catalog1).await.unwrap();
+    ctx.register_catalog("cat2", catalog2).await.unwrap();
+
+    // Create a table in cat2
+    ctx.sql("CREATE SCHEMA cat2.mydb").await.unwrap();
+    ctx.sql("CREATE TABLE cat2.mydb.t (id INT NOT NULL, name VARCHAR, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+    ctx.sql("INSERT INTO cat2.mydb.t VALUES (1, 'hello')")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // Switch default catalog via raw DataFusion SET instead of set_current_catalog()
+    ctx.sql("SET datafusion.catalog.default_catalog = 'cat2'")
+        .await
+        .unwrap();
+    ctx.set_current_database("mydb").await.unwrap();
+
+    // Unqualified query should now resolve against cat2.mydb
+    let batches = ctx
+        .sql("SELECT id, name FROM t")
+        .await
+        .expect("Unqualified table should resolve via DataFusion default_catalog config")
+        .collect()
+        .await
+        .unwrap();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+
+    // DDL on unqualified name should also go to cat2.
+    // CREATE TABLE in mydb should succeed because cat2.mydb exists.
+    ctx.sql("CREATE TABLE mydb.t2 (id INT NOT NULL, PRIMARY KEY (id))")
+        .await
+        .expect("CREATE TABLE should resolve against cat2 after SET default_catalog");
+
+    // Verify the table was created in cat2 by querying with fully qualified name
+    let df = ctx.sql("SELECT * FROM cat2.mydb.t2").await;
+    assert!(
+        df.is_ok(),
+        "Table t2 should exist in cat2.mydb after unqualified CREATE TABLE"
+    );
+}
+
+#[tokio::test]
+async fn test_first_registered_catalog_is_default() {
+    let (_tmp, catalog) = create_test_env();
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog).await.unwrap();
+
+    ctx.sql("CREATE SCHEMA paimon.mydb").await.unwrap();
+    ctx.sql("CREATE TABLE paimon.mydb.t (id INT NOT NULL, PRIMARY KEY (id))")
+        .await
+        .unwrap();
+
+    ctx.set_current_database("mydb").await.unwrap();
+
+    // Should resolve to paimon.mydb.t without calling set_current_catalog
+    let df = ctx.sql("SELECT * FROM t").await;
+    assert!(
+        df.is_ok(),
+        "First registered catalog should be the default for unqualified queries"
+    );
+}
+
+#[tokio::test]
+async fn test_one_part_table_name_uses_current_database() {
+    let (_tmp, catalog) = create_test_env();
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+
+    catalog
+        .create_database("mydb", false, Default::default())
+        .await
+        .unwrap();
+    ctx.set_current_database("mydb").await.unwrap();
+
+    // 1-part name: "users" should resolve to paimon.mydb.users
+    ctx.sql(
+        "CREATE TABLE users (
+            id INT NOT NULL,
+            name STRING,
+            PRIMARY KEY (id)
+        )",
+    )
+    .await
+    .expect("CREATE TABLE with 1-part name should succeed");
+
+    let tables = catalog.list_tables("mydb").await.unwrap();
+    assert!(
+        tables.contains(&"users".to_string()),
+        "Table should be created in the current database"
+    );
+
+    // SELECT with 1-part name should also work
+    let df = ctx.sql("SELECT * FROM users").await;
+    assert!(
+        df.is_ok(),
+        "SELECT with 1-part name should resolve correctly"
+    );
 }
